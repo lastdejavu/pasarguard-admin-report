@@ -68,7 +68,7 @@ Unlimited users:
 reza2022
 
 
-git clone https://github.com/<YOUR_USERNAME>/pasarguard-admin-report.git
+git clone https://github.com/lastdejavu/pasarguard-admin-report.git
 cd pasarguard-admin-report
 
 python3 -m venv .venv
