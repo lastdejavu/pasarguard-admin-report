@@ -90,3 +90,17 @@ Total: 70.00 GB
 
 Unlimited users:
 reza2022
+
+<div dir="rtl">
+
+## 🚀 نصب سریع (پیشنهادی)
+
+✅ فقط با ۳ دستور نصب کامل انجام می‌شود (ساخت venv + تنظیم env + کرون + نصب تریگرها به‌صورت اختیاری):
+
+</div>
+
+```bash
+git clone https://github.com/lastdejavu/pasarguard-admin-report.git
+cd pasarguard-admin-report
+sudo bash install.sh
+
