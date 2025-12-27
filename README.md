@@ -1,3 +1,9 @@
+
+git clone https://github.com/lastdejavu/pasarguard-admin-report.git
+cd pasarguard-admin-report
+sudo bash install.sh
+
+
 # PasarGuard Admin Report 📊
 
 اسکریپت گزارش‌گیری حرفه‌ای برای **PasarGuard / Marzban Panel** که به‌صورت خودکار گزارش‌های **روزانه / هفتگی / ماهانه** را از دیتابیس استخراج می‌کند و برای شما در **تلگرام** ارسال می‌کند.
