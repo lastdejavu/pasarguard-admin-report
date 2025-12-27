@@ -2,74 +2,62 @@
 set -e
 
 APP_NAME="pasarguard-admin-report"
-APP_DIR="/opt/pasarguard-admin-report"
-PY_SCRIPT="pasarguard_admin_report.py"
-ENV_FILE=".env"
-VENV_DIR=".venv"
+INSTALL_DIR="/opt/$APP_NAME"
+REPO_DIR="$(pwd)"
 
 echo "======================================"
 echo "✅ $APP_NAME Installer"
 echo "======================================"
 echo ""
 
-# -----------------------------
-#  Check root
-# -----------------------------
-if [[ $EUID -ne 0 ]]; then
-   echo "❌ Please run as root: sudo bash install.sh"
-   exit 1
-fi
-
-# -----------------------------
-#  Install packages
-# -----------------------------
+# ---------------------------
+# Install system packages
+# ---------------------------
 echo "📦 Installing system packages..."
 apt update -y
-apt install -y python3 python3-venv python3-pip cron git nano
+apt install -y python3 python3-pip python3-venv cron git nano mariadb-client
 
-# -----------------------------
-#  Clone / Copy project
-# -----------------------------
-echo "📁 Installing script into: $APP_DIR"
+echo ""
+echo "📁 Installing script into: $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+cp -r "$REPO_DIR/"* "$INSTALL_DIR"
+cd "$INSTALL_DIR"
 
-mkdir -p "$APP_DIR"
-cp -r ./* "$APP_DIR"
-cd "$APP_DIR"
-
-# -----------------------------
-#  Ask user config
-# -----------------------------
+# ---------------------------
+# Configuration Wizard
+# ---------------------------
 echo ""
 echo "⚙️ Configuration Wizard"
 echo "--------------------------------------"
 
-read -p "MySQL Host (default: 127.0.0.1): " MYSQL_HOST
+read -rp "MySQL Host (default: 127.0.0.1): " MYSQL_HOST
 MYSQL_HOST=${MYSQL_HOST:-127.0.0.1}
 
-read -p "MySQL Port (default: 3306): " MYSQL_PORT
+read -rp "MySQL Port (default: 3306): " MYSQL_PORT
 MYSQL_PORT=${MYSQL_PORT:-3306}
 
-read -p "MySQL Username (default: root): " MYSQL_USER
+read -rp "MySQL Username (default: root): " MYSQL_USER
 MYSQL_USER=${MYSQL_USER:-root}
 
-read -sp "MySQL Password: " MYSQL_PASS
+read -rsp "MySQL Password: " MYSQL_PASS
 echo ""
 
-read -p "MySQL Database (default: pasarguard): " MYSQL_DB
+read -rp "MySQL Database (default: pasarguard): " MYSQL_DB
 MYSQL_DB=${MYSQL_DB:-pasarguard}
 
 echo ""
-read -p "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
-read -p "Telegram Chat ID: " TELEGRAM_CHAT_ID
+read -rp "Telegram Bot Token: " TELEGRAM_BOT_TOKEN
+read -rp "Telegram Chat ID: " TELEGRAM_CHAT_ID
 
-echo ""
-read -p "Timezone (default: Asia/Tehran): " TZ
+read -rp "Timezone (default: Asia/Tehran): " TZ
 TZ=${TZ:-Asia/Tehran}
 
+# ---------------------------
+# Write .env
+# ---------------------------
 echo ""
-echo "✅ Writing $ENV_FILE ..."
-
-cat > "$ENV_FILE" <<EOF
+echo "✅ Writing .env ..."
+cat > .env <<EOF
 MYSQL_HOST=$MYSQL_HOST
 MYSQL_PORT=$MYSQL_PORT
 MYSQL_USER=$MYSQL_USER
@@ -82,58 +70,66 @@ TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
 TZ=$TZ
 EOF
 
-chmod 600 "$ENV_FILE"
-
-# -----------------------------
-#  Create venv & install deps
-# -----------------------------
+# ---------------------------
+# Create venv & install deps
+# ---------------------------
 echo ""
 echo "🐍 Creating python virtualenv..."
-python3 -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
+python3 -m venv .venv
+source .venv/bin/activate
 
 echo "📦 Installing python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-deactivate
+# ---------------------------
+# Install triggers
+# ---------------------------
+echo ""
+read -rp "Install database triggers? (recommended) (y/n): " INSTALL_TRIGGERS
+if [[ "$INSTALL_TRIGGERS" == "y" || "$INSTALL_TRIGGERS" == "Y" ]]; then
+  echo "⚡ Installing triggers..."
+  mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASS" "$MYSQL_DB" < triggers.sql
+  echo "✅ Triggers installed!"
+else
+  echo "⚠️ Skipping triggers installation."
+fi
 
-# -----------------------------
-#  Cron jobs
-# -----------------------------
+# ---------------------------
+# Setup Cron Jobs
+# ---------------------------
 echo ""
 echo "⏰ Setting up cron jobs..."
 
-CRON_DAILY="5 0 * * * TZ=$TZ $APP_DIR/$VENV_DIR/bin/python $APP_DIR/$PY_SCRIPT >> /var/log/pasarguard_admin_report.log 2>&1"
-CRON_WEEKLY="10 0 * * 6 TZ=$TZ $APP_DIR/$VENV_DIR/bin/python $APP_DIR/$PY_SCRIPT weekly >> /var/log/pasarguard_weekly.log 2>&1"
-CRON_MONTHLY="15 0 1 * * TZ=$TZ $APP_DIR/$VENV_DIR/bin/python $APP_DIR/$PY_SCRIPT monthly >> /var/log/pasarguard_monthly.log 2>&1"
+CRON_TMP=$(mktemp)
 
-(crontab -l 2>/dev/null | grep -v "$APP_DIR/$PY_SCRIPT" || true; echo "$CRON_DAILY"; echo "$CRON_WEEKLY"; echo "$CRON_MONTHLY") | crontab -
+crontab -l 2>/dev/null > "$CRON_TMP" || true
+
+grep -v "$INSTALL_DIR/pasarguard_admin_report.py" "$CRON_TMP" > "$CRON_TMP.clean" || true
+mv "$CRON_TMP.clean" "$CRON_TMP"
+
+echo "TZ=$TZ" >> "$CRON_TMP"
+
+echo "5 0 * * * $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/pasarguard_admin_report.py >> /var/log/pasarguard_admin_report.log 2>&1" >> "$CRON_TMP"
+echo "10 0 * * 6 $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/pasarguard_admin_report.py weekly >> /var/log/pasarguard_weekly.log 2>&1" >> "$CRON_TMP"
+echo "15 0 1 * * $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/pasarguard_admin_report.py monthly >> /var/log/pasarguard_monthly.log 2>&1" >> "$CRON_TMP"
+
+crontab "$CRON_TMP"
+rm "$CRON_TMP"
 
 echo "✅ Cron jobs installed!"
-echo ""
 
-# -----------------------------
-#  Final test
-# -----------------------------
+# ---------------------------
+# Test Run
+# ---------------------------
+echo ""
 echo "✅ Installation finished!"
 echo ""
-echo "📌 Test run now?"
-read -p "Run daily test now? (y/n): " RUN_TEST
-
-if [[ "$RUN_TEST" == "y" ]]; then
-    echo "🚀 Running daily report test..."
-    source "$VENV_DIR/bin/activate"
-    python "$PY_SCRIPT"
-    deactivate
-    echo "✅ Test finished. Check Telegram."
+read -rp "Run daily test now? (y/n): " RUN_TEST
+if [[ "$RUN_TEST" == "y" || "$RUN_TEST" == "Y" ]]; then
+  echo "🚀 Running daily report test..."
+  "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/pasarguard_admin_report.py"
 fi
 
 echo ""
-echo "======================================"
-echo "✅ Done! Installed at: $APP_DIR"
-echo "Logs:"
-echo " - /var/log/pasarguard_admin_report.log"
-echo " - /var/log/pasarguard_weekly.log"
-echo " - /var/log/pasarguard_monthly.log"
-echo "======================================"
+echo "🎉 Done!"
