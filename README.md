@@ -91,6 +91,7 @@ Total: 70.00 GB
 Unlimited users:
 reza2022
 
+
 <div dir="rtl">
 
 ## 🚀 نصب سریع (پیشنهادی)
@@ -103,4 +104,4 @@ reza2022
 git clone https://github.com/lastdejavu/pasarguard-admin-report.git
 cd pasarguard-admin-report
 sudo bash install.sh
-
+<div dir="rtl"> ```
