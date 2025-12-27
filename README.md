@@ -21,3 +21,14 @@ Total: 70.00 GB
 
 Unlimited users:
 reza2022
+
+
+Summary - 1404-10-06
+
+Admins:
+- admin58586: 70.00 GB | unlimited: 1
+- cheaterin: 0.00 GB | unlimited: 1
+- router: 250.00 GB | unlimited: 0
+
+Total all: 320.00 GB | unlimited total: 2
+
