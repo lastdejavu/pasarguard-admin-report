@@ -66,3 +66,36 @@ Total: 70.00 GB
 
 Unlimited users:
 reza2022
+
+
+git clone https://github.com/<YOUR_USERNAME>/pasarguard-admin-report.git
+cd pasarguard-admin-report
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+cp .env.example .env
+nano .env
+
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASS=YOUR_PASSWORD
+MYSQL_DB=pasarguard
+
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+
+TZ=Asia/Tehran
+
+# Daily report (هر روز ساعت 00:05)
+5 0 * * * /usr/bin/python3 /opt/pasarguard/pasarguard_admin_report.py >> /var/log/pasarguard_admin_report.log 2>&1
+
+# Weekly report (هر شنبه ساعت 00:10)
+10 0 * * 6 /usr/bin/python3 /opt/pasarguard/pasarguard_admin_report.py weekly >> /var/log/pasarguard_weekly.log 2>&1
+
+# Monthly report (اول هر ماه شمسی ساعت 00:15)
+15 0 1 * * /usr/bin/python3 /opt/pasarguard/pasarguard_admin_report.py monthly >> /var/log/pasarguard_monthly.log 2>&1
+
