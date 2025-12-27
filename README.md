@@ -91,18 +91,10 @@ Total: 70.00 GB
 Unlimited users:
 reza2022
 ```
+🚀 نصب سریع (پیشنهادی)
 
-### ✅ گزارش روزانه (نمونه خروجی)
+✅ فقط با ۳ دستور نصب کامل انجام می‌شود (ساخت venv + تنظیم env + کرون + نصب Triggers اختیاری):
 
-```text
-Daily report - 1404-10-06
-Admin: admin58586
-
-- ali: +50.00 GB
-- reza2022: unlimited
-- m12: +20.00 GB | reset
-
-Total: 70.00 GB
-
-Unlimited users:
-reza2022
+git clone https://github.com/lastdejavu/pasarguard-admin-report.git
+cd pasarguard-admin-report
+sudo bash install.sh
