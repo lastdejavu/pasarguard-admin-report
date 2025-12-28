@@ -1,5 +1,5 @@
 -- ============================================================
--- PasarGuard / Marzban Logs Triggers
+-- PasarGuard /  Logs Triggers
 -- This will auto-log admin actions into users_logs table
 -- ============================================================
 
