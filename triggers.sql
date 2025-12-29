@@ -1,108 +1,71 @@
--- ============================================================
--- PasarGuard /  Logs Triggers
--- This will auto-log admin actions into users_logs table
--- ============================================================
+sudo tee /opt/pasarguard-admin-report/triggers.sql >/dev/null <<'SQL'
+USE pasarguard;
 
-DROP TRIGGER IF EXISTS InsertLog;
-DROP TRIGGER IF EXISTS UpdateLog;
-DROP TRIGGER IF EXISTS DeleteLog;
+-- جدول رویدادها (برای گزارش‌گیری)
+CREATE TABLE IF NOT EXISTS admin_report_events (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_type VARCHAR(64) NOT NULL,
+
+  admin_id INT NULL,
+  user_id INT NULL,
+  username VARCHAR(255) NULL,
+
+  old_data_limit BIGINT NULL,
+  new_data_limit BIGINT NULL,
+
+  old_used BIGINT NULL,
+  new_used BIGINT NULL,
+
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  INDEX idx_created_at (created_at),
+  INDEX idx_admin_created (admin_id, created_at),
+  INDEX idx_username_created (username, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 DELIMITER $$
 
-CREATE TRIGGER InsertLog
+DROP TRIGGER IF EXISTS trg_report_user_create $$
+CREATE TRIGGER trg_report_user_create
 AFTER INSERT ON users
 FOR EACH ROW
 BEGIN
-  INSERT INTO users_logs (
-    admin_id,
-    user_id,
-    data_limit_old,
-    data_limit_new,
-    expire_old,
-    expire_new,
-    used_traffic_old,
-    used_traffic_new,
-    action,
-    log_date
-  )
-  VALUES (
-    NEW.admin_id,
-    NEW.id,
-    NULL,
-    NEW.data_limit,
-    NULL,
-    NEW.expire,
-    NULL,
-    NEW.used_traffic,
-    'INSERT',
-    NOW()
-  );
-END$$
+  IF NEW.data_limit IS NULL THEN
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, new_data_limit, new_used)
+    VALUES ('UNLIMITED_CREATED', NEW.admin_id, NEW.id, NEW.username, NEW.data_limit, NEW.used_traffic);
+  ELSE
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, new_data_limit, new_used)
+    VALUES ('USER_CREATED', NEW.admin_id, NEW.id, NEW.username, NEW.data_limit, NEW.used_traffic);
+  END IF;
+END $$
 
-CREATE TRIGGER UpdateLog
+DROP TRIGGER IF EXISTS trg_report_user_update $$
+CREATE TRIGGER trg_report_user_update
 AFTER UPDATE ON users
 FOR EACH ROW
 BEGIN
-  INSERT INTO users_logs (
-    admin_id,
-    user_id,
-    data_limit_old,
-    data_limit_new,
-    expire_old,
-    expire_new,
-    used_traffic_old,
-    used_traffic_new,
-    action,
-    log_date
-  )
-  VALUES (
-    NEW.admin_id,
-    NEW.id,
-    OLD.data_limit,
-    NEW.data_limit,
-    OLD.expire,
-    NEW.expire,
-    OLD.used_traffic,
-    NEW.used_traffic,
-    CASE
-      WHEN OLD.data_limit <> NEW.data_limit AND (NEW.data_limit IS NULL OR NEW.data_limit = 0) THEN 'UNLIMITED'
-      WHEN OLD.data_limit <> NEW.data_limit THEN 'CHANGE_LIMIT'
-      WHEN OLD.expire <> NEW.expire THEN 'CHANGE_EXPIRE'
-      WHEN OLD.used_traffic <> NEW.used_traffic AND NEW.used_traffic = 0 THEN 'RESET_USAGE'
-      ELSE 'UPDATE'
-    END,
-    NOW()
-  );
-END$$
+  -- محدود -> انلیمیت
+  IF (OLD.data_limit IS NOT NULL AND NEW.data_limit IS NULL) THEN
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
+    VALUES ('LIMIT_TO_UNLIMITED', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
 
-CREATE TRIGGER DeleteLog
-AFTER DELETE ON users
-FOR EACH ROW
-BEGIN
-  INSERT INTO users_logs (
-    admin_id,
-    user_id,
-    data_limit_old,
-    data_limit_new,
-    expire_old,
-    expire_new,
-    used_traffic_old,
-    used_traffic_new,
-    action,
-    log_date
-  )
-  VALUES (
-    OLD.admin_id,
-    OLD.id,
-    OLD.data_limit,
-    NULL,
-    OLD.expire,
-    NULL,
-    OLD.used_traffic,
-    NULL,
-    'DELETE',
-    NOW()
-  );
-END$$
+  -- انلیمیت -> محدود (برای اینکه بعداً اگر خواستی مانیتور کنی)
+  ELSEIF (OLD.data_limit IS NULL AND NEW.data_limit IS NOT NULL) THEN
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
+    VALUES ('UNLIMITED_TO_LIMIT', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
+
+  -- تغییر حجم محدود -> محدود
+  ELSEIF (OLD.data_limit IS NOT NULL AND NEW.data_limit IS NOT NULL AND OLD.data_limit <> NEW.data_limit) THEN
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
+    VALUES ('DATA_LIMIT_CHANGED', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
+  END IF;
+
+  -- ریست مصرف (اگر مصرف کم شد)
+  IF (OLD.used_traffic > NEW.used_traffic) THEN
+    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_used, new_used)
+    VALUES ('USAGE_RESET', NEW.admin_id, NEW.id, NEW.username, OLD.used_traffic, NEW.used_traffic);
+  END IF;
+END $$
 
 DELIMITER ;
+SQL
