@@ -60,7 +60,7 @@ Total: 50.00 GB
 - Ubuntu (پیشنهادی 22.04)
 - Telegram Bot Token و Chat ID
 
-> ⚠️ امنیت: هرگز `.env` یا Token را داخل گیت‌هاب کامیت نکنید.
+
 
 ---
 
