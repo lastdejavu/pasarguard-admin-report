@@ -1,126 +1,142 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="pasarguard-admin-report"
-INSTALL_DIR="/opt/pasarguard-admin-report"
-PASARGUARD_ENV="/opt/pasarguard/.env"
-LOG_FILE="/var/log/pasarguard-admin-report.log"
+echo "======================================"
+echo "✅ pasarguard-admin-report one-line installer"
+echo "======================================"
 
-DEFAULT_TZ="Asia/Tehran"
-CRON_TIME="0 0 * * *"  # 00:00 every day
+if [[ "${EUID:-0}" -ne 0 ]]; then
+  echo "❌ Please run as root (use sudo)."
+  exit 1
+fi
 
-# ----------------------------
-# helpers
-# ----------------------------
-info(){ echo -e "ℹ️  $*"; }
-ok(){ echo -e "✅ $*"; }
-warn(){ echo -e "⚠️  $*" >&2; }
-die(){ echo -e "❌ $*" >&2; exit 1; }
+APP_DIR="/opt/pasarguard-admin-report"
+PASARGUARD_ENV_DEFAULT="/opt/pasarguard/.env"
 
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "Please run as root: sudo bash install.sh  (or one-line curl | sudo bash)"
-  fi
-}
+# -------- helpers --------
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
-}
-
-read_env_value() {
-  # read_env_value KEY /path/to/.env
+read_env_val() {
+  # read_env_val KEY FILE
   local key="$1" file="$2"
-  [[ -f "$file" ]] || return 0
-  # keep everything after first '=' (supports passwords with special chars)
-  local line
-  line="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 || true)"
-  [[ -n "$line" ]] || return 0
-  echo "${line#*=}"
+  grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | cut -d= -f2- || true
 }
 
-prompt_default() {
-  # prompt_default "Label" "default"
-  local label="$1" def="$2"
-  local ans
-  read -r -p "${label} (default: ${def}): " ans || true
-  if [[ -z "${ans// }" ]]; then echo "$def"; else echo "$ans"; fi
+trim() {
+  # trim spaces/newlines
+  echo -n "$1" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'
 }
 
-prompt_secret() {
-  # prompt_secret "Label"
-  local label="$1"
-  local ans
-  read -r -s -p "${label}: " ans || true
-  echo
-  echo "$ans"
-}
+# -------- packages --------
+echo "ℹ️  Installing packages (python3, venv, cron, curl)..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null
+apt-get install -y python3 python3-venv python3-pip cron curl >/dev/null
+echo "✅ Packages installed."
 
-validate_bot_token() {
-  local token="$1"
-  # returns bot username or empty
-  local resp
-  resp="$(curl -fsS "https://api.telegram.org/bot${token}/getMe" 2>/dev/null || true)"
-  echo "$resp" | grep -q '"ok":true' || return 1
-  # extract username roughly without jq
-  echo "$resp" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p' | head -n1
-}
+# -------- docker presence --------
+if ! need_cmd docker; then
+  echo "❌ Docker not found. PasarGuard must be installed via Docker."
+  exit 1
+fi
 
-send_test_message() {
-  local token="$1" chat="$2" text="$3"
-  curl -fsS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-    -d "chat_id=${chat}" \
-    -d "text=${text}" \
-    -d "disable_web_page_preview=true" >/dev/null
-}
+# -------- find pasarguard env --------
+PASARGUARD_ENV="${PASARGUARD_ENV:-$PASARGUARD_ENV_DEFAULT}"
+if [[ ! -f "$PASARGUARD_ENV" ]]; then
+  echo "❌ PasarGuard env not found at: $PASARGUARD_ENV"
+  echo "   Set PASARGUARD_ENV=/path/to/.env and re-run."
+  exit 1
+fi
+echo "ℹ️  Found PasarGuard env: $PASARGUARD_ENV"
 
-detect_mysql_container() {
-  # prefer common name
-  if docker ps --format '{{.Names}}' | grep -qx "pasarguard-mysql-1"; then
-    echo "pasarguard-mysql-1"
-    return
+MYSQL_ROOT_PASSWORD="$(trim "$(read_env_val MYSQL_ROOT_PASSWORD "$PASARGUARD_ENV")")"
+DB_NAME="$(trim "$(read_env_val DB_NAME "$PASARGUARD_ENV")")"
+[[ -z "$DB_NAME" ]] && DB_NAME="pasarguard"
+
+if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
+  echo "❌ MYSQL_ROOT_PASSWORD not found in $PASARGUARD_ENV"
+  exit 1
+fi
+
+# -------- detect mysql container --------
+MYSQL_CONTAINER="${MYSQL_CONTAINER:-}"
+if [[ -z "$MYSQL_CONTAINER" ]]; then
+  # prefer pasarguard-mysql-1
+  if docker ps --format '{{.Names}}' | grep -qx 'pasarguard-mysql-1'; then
+    MYSQL_CONTAINER="pasarguard-mysql-1"
+  else
+    # fallback: first container whose image/name looks like mysql
+    MYSQL_CONTAINER="$(docker ps --format '{{.Names}} {{.Image}}' | awk 'tolower($0) ~ /mysql/ {print $1; exit}')"
   fi
-  # otherwise: first container whose image contains mysql and running
-  local c
-  c="$(docker ps --format '{{.Names}}\t{{.Image}}' | awk '$2 ~ /mysql/i {print $1; exit}')"
-  if [[ -n "$c" ]]; then
-    echo "$c"
-    return
-  fi
-  echo ""
-}
+fi
 
-install_packages() {
-  info "Installing packages (python3, venv, pip, cron, curl)..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y python3 python3-venv python3-pip cron curl >/dev/null
-  ok "Packages installed."
-}
+if [[ -z "$MYSQL_CONTAINER" ]]; then
+  echo "❌ Could not detect MySQL container. Set MYSQL_CONTAINER=... and re-run."
+  docker ps --format "table {{.Names}}\t{{.Image}}"
+  exit 1
+fi
+echo "ℹ️  Detected MySQL container: $MYSQL_CONTAINER"
+echo "ℹ️  DB name: $DB_NAME"
 
-write_requirements() {
-  cat > "${INSTALL_DIR}/requirements.txt" <<'REQ'
-pymysql==1.1.2
-requests==2.32.5
-jdatetime==5.2.0
+# -------- telegram config (non-interactive supported) --------
+# You can pass env vars:
+#   TELEGRAM_BOT_TOKEN="xxx" TELEGRAM_CHAT_ID="yyy" curl ... | sudo -E bash
+TIMEZONE="${TIMEZONE:-Asia/Tehran}"
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+# If existing .env exists, reuse values unless explicitly provided
+if [[ -f "$APP_DIR/.env" ]]; then
+  prev_bot="$(trim "$(read_env_val TELEGRAM_BOT_TOKEN "$APP_DIR/.env")")"
+  prev_chat="$(trim "$(read_env_val TELEGRAM_CHAT_ID "$APP_DIR/.env")")"
+  prev_tz="$(trim "$(read_env_val TIMEZONE "$APP_DIR/.env")")"
+  [[ -z "$BOT_TOKEN" ]] && BOT_TOKEN="$prev_bot"
+  [[ -z "$CHAT_ID" ]] && CHAT_ID="$prev_chat"
+  [[ -z "${TIMEZONE:-}" ]] && TIMEZONE="${prev_tz:-Asia/Tehran}"
+fi
+
+if [[ -z "$BOT_TOKEN" ]]; then
+  echo -n "Telegram Bot Token: "
+  read -r BOT_TOKEN
+  BOT_TOKEN="$(trim "$BOT_TOKEN")"
+fi
+
+if [[ -z "$CHAT_ID" ]]; then
+  echo -n "Telegram Chat ID: "
+  read -r CHAT_ID
+  CHAT_ID="$(trim "$CHAT_ID")"
+fi
+
+if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+  echo "❌ Telegram Bot Token / Chat ID is required."
+  exit 1
+fi
+
+# -------- create dir --------
+mkdir -p "$APP_DIR"
+chmod 700 "$APP_DIR"
+
+# -------- write requirements --------
+cat >"$APP_DIR/requirements.txt" <<'REQ'
+requests==2.32.3
 python-dotenv==1.0.1
+jdatetime==5.0.0
 REQ
-}
 
-write_triggers_sql() {
-  cat > "${INSTALL_DIR}/triggers.sql" <<'SQL'
--- PasarGuard Admin Report triggers (MySQL 8+)
--- Creates:
---   - admin_report_events table (with reported_at to avoid duplicate reporting)
---   - triggers on users: create + limit change + limit->unlimited + unlimited->limit + usage reset
+# -------- write triggers.sql (reported_at) --------
+cat >"$APP_DIR/triggers.sql" <<'SQL'
+-- NOTE:
+-- Installer runs this file with the correct database selected (DB_NAME).
+-- So we do NOT hardcode "USE pasarguard;" here.
 
-USE pasarguard;
-
+-- Create table if missing (new installs)
 CREATE TABLE IF NOT EXISTS admin_report_events (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 
   event_type VARCHAR(64) NOT NULL,
+
   admin_id BIGINT NULL,
-  user_id BIGINT NULL,
+  user_id  BIGINT NULL,
   username VARCHAR(255) NULL,
 
   old_data_limit BIGINT NULL,
@@ -129,14 +145,51 @@ CREATE TABLE IF NOT EXISTS admin_report_events (
   old_used BIGINT NULL,
   new_used BIGINT NULL,
 
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  reported_at TIMESTAMP NULL DEFAULT NULL,
+  reported_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-  INDEX idx_created_at (created_at),
   INDEX idx_reported_at (reported_at),
-  INDEX idx_admin_created (admin_id, created_at),
-  INDEX idx_admin_reported (admin_id, reported_at)
+  INDEX idx_admin_time (admin_id, reported_at),
+  INDEX idx_user_time (user_id, reported_at)
 );
+
+-- Migration for older installs: if table exists but reported_at does not, add it.
+SET @has_col := (
+  SELECT COUNT(*)
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'admin_report_events'
+    AND COLUMN_NAME = 'reported_at'
+);
+
+SET @sql := IF(
+  @has_col = 0,
+  'ALTER TABLE admin_report_events ADD COLUMN reported_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP',
+  'SELECT 1'
+);
+
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- If older installs used created_at, copy to reported_at when reported_at is null-ish (rare).
+-- Safe best-effort:
+SET @has_created_at := (
+  SELECT COUNT(*)
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'admin_report_events'
+    AND COLUMN_NAME = 'created_at'
+);
+
+SET @sql2 := IF(
+  @has_created_at > 0,
+  'UPDATE admin_report_events SET reported_at = created_at WHERE reported_at IS NULL',
+  'SELECT 1'
+);
+
+PREPARE stmt2 FROM @sql2;
+EXECUTE stmt2;
+DEALLOCATE PREPARE stmt2;
 
 DELIMITER $$
 
@@ -146,11 +199,23 @@ AFTER INSERT ON users
 FOR EACH ROW
 BEGIN
   IF NEW.data_limit IS NULL THEN
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, new_data_limit, new_used)
-    VALUES ('UNLIMITED_CREATED', NEW.admin_id, NEW.id, NEW.username, NEW.data_limit, NEW.used_traffic);
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      new_data_limit, new_used
+    )
+    VALUES (
+      'UNLIMITED_CREATED', NEW.admin_id, NEW.id, NEW.username,
+      NULL, NEW.used_traffic
+    );
   ELSE
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, new_data_limit, new_used)
-    VALUES ('USER_CREATED', NEW.admin_id, NEW.id, NEW.username, NEW.data_limit, NEW.used_traffic);
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      new_data_limit, new_used
+    )
+    VALUES (
+      'USER_CREATED', NEW.admin_id, NEW.id, NEW.username,
+      NEW.data_limit, NEW.used_traffic
+    );
   END IF;
 END $$
 
@@ -161,57 +226,92 @@ FOR EACH ROW
 BEGIN
   -- limited -> unlimited
   IF (OLD.data_limit IS NOT NULL AND NEW.data_limit IS NULL) THEN
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
-    VALUES ('LIMIT_TO_UNLIMITED', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      old_data_limit, new_data_limit, old_used, new_used
+    )
+    VALUES (
+      'LIMIT_TO_UNLIMITED', NEW.admin_id, NEW.id, NEW.username,
+      OLD.data_limit, NULL, OLD.used_traffic, NEW.used_traffic
+    );
 
-  -- unlimited -> limited (usually not a loss; still recorded for audit)
+  -- unlimited -> limited
   ELSEIF (OLD.data_limit IS NULL AND NEW.data_limit IS NOT NULL) THEN
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
-    VALUES ('UNLIMITED_TO_LIMIT', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      old_data_limit, new_data_limit, old_used, new_used
+    )
+    VALUES (
+      'UNLIMITED_TO_LIMIT', NEW.admin_id, NEW.id, NEW.username,
+      NULL, NEW.data_limit, OLD.used_traffic, NEW.used_traffic
+    );
 
-  -- limited -> limited (volume change)
-  ELSEIF (OLD.data_limit IS NOT NULL AND NEW.data_limit IS NOT NULL AND OLD.data_limit <> NEW.data_limit) THEN
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_data_limit, new_data_limit, old_used, new_used)
-    VALUES ('DATA_LIMIT_CHANGED', NEW.admin_id, NEW.id, NEW.username, OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic);
+  -- limited -> limited limit change
+  ELSEIF (OLD.data_limit <> NEW.data_limit) THEN
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      old_data_limit, new_data_limit, old_used, new_used
+    )
+    VALUES (
+      'DATA_LIMIT_CHANGED', NEW.admin_id, NEW.id, NEW.username,
+      OLD.data_limit, NEW.data_limit, OLD.used_traffic, NEW.used_traffic
+    );
   END IF;
 
-  -- usage reset (any decrease)
+  -- usage reset (used decreases)
   IF (OLD.used_traffic > NEW.used_traffic) THEN
-    INSERT INTO admin_report_events(event_type, admin_id, user_id, username, old_used, new_used)
-    VALUES ('USAGE_RESET', NEW.admin_id, NEW.id, NEW.username, OLD.used_traffic, NEW.used_traffic);
+    -- IMPORTANT:
+    -- store current limit in new_data_limit so digest can charge FULL LIMIT on reset (your policy)
+    INSERT INTO admin_report_events(
+      event_type, admin_id, user_id, username,
+      new_data_limit, old_used, new_used
+    )
+    VALUES (
+      'USAGE_RESET', NEW.admin_id, NEW.id, NEW.username,
+      NEW.data_limit, OLD.used_traffic, NEW.used_traffic
+    );
   END IF;
 END $$
 
 DELIMITER ;
 SQL
-}
 
-write_daily_digest_py() {
-  cat > "${INSTALL_DIR}/daily_digest.py" <<'PY'
-import os, time
-import pymysql
+# -------- write daily_digest.py (uses docker exec, no host mysql needed) --------
+cat >"$APP_DIR/daily_digest.py" <<'PY'
+import os
+import time
+import subprocess
 import requests
 import jdatetime
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-ENV_PATH = "/opt/pasarguard-admin-report/.env"
-load_dotenv(ENV_PATH)
+APP_ENV = "/opt/pasarguard-admin-report/.env"
+PASARGUARD_ENV = os.getenv("PASARGUARD_ENV", "/opt/pasarguard/.env")
+
+load_dotenv(APP_ENV)
 
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran"))
 
-MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-MYSQL_USER = os.getenv("MYSQL_USER")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
-MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "pasarguard")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+MYSQL_CONTAINER = os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1").strip()
 
-INCLUDE_RESETS = os.getenv("INCLUDE_RESETS", "1") == "1"
 SHOW_LIMIT_AFTER_UNLIMITED = os.getenv("SHOW_LIMIT_AFTER_UNLIMITED", "1") == "1"
+CHARGE_FULL_LIMIT_ON_RESET = os.getenv("CHARGE_FULL_LIMIT_ON_RESET", "1") == "1"
+
+def _read_env_val(path: str, key: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        return ""
+    return ""
 
 def send(text: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -229,386 +329,298 @@ def gb_from_bytes(n: int) -> float:
 def fmt_gb(n_gb: float) -> str:
     return f"{n_gb:.2f} GB"
 
-def _range_tehran(mode: str):
+def tehran_range(mode: str):
     now = datetime.now(TZ)
     start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if mode == "today":
         return start_today, now
-    # default: yesterday [00:00, 00:00)
     start_yesterday = start_today - timedelta(days=1)
     return start_yesterday, start_today
 
-def jalali_date_str(greg_date):
-    j = jdatetime.date.fromgregorian(date=greg_date)
-    return f"{j.year:04d}-{j.month:02d}-{j.day:02d}"
-
-def connect():
-    return pymysql.connect(
-        host=MYSQL_HOST, port=MYSQL_PORT,
-        user=MYSQL_USER, password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=10,
-        autocommit=True
-    )
-
-def fetch_events(start_dt, end_dt, override: bool):
-    # reported_at logic: if override=False only fetch unreported rows
-    cond = "" if override else "AND e.reported_at IS NULL"
-    q = f"""
-        SELECT
-            e.id, e.event_type, e.admin_id,
-            a.username AS admin_username,
-            e.user_id, e.username,
-            e.old_data_limit, e.new_data_limit,
-            e.old_used, e.new_used,
-            e.created_at
-        FROM admin_report_events e
-        LEFT JOIN admins a ON a.id = e.admin_id
-        WHERE e.created_at >= %s AND e.created_at < %s
-        {cond}
-        ORDER BY e.admin_id ASC, e.id ASC
+def _mysql_rows(db: str, sql: str):
     """
-    conn = connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(q, (start_dt.replace(tzinfo=None), end_dt.replace(tzinfo=None)))
-            return cur.fetchall()
-    finally:
-        conn.close()
+    Run SQL inside the MySQL container using root password from PASARGUARD_ENV.
+    Returns rows as list[list[str]] from tab-separated output.
+    """
+    root_pwd = _read_env_val(PASARGUARD_ENV, "MYSQL_ROOT_PASSWORD")
+    if not root_pwd:
+        raise RuntimeError(f"MYSQL_ROOT_PASSWORD not found in {PASARGUARD_ENV}")
 
-def mark_reported(ids):
-    if not ids:
+    cmd = [
+        "docker", "exec", "-i",
+        "-e", f"MYSQL_PWD={root_pwd}",
+        MYSQL_CONTAINER,
+        "mysql",
+        "-uroot",
+        "-N", "-B", "--raw",
+        db,
+        "-e", sql
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "mysql exec failed")
+
+    out = p.stdout.strip("\n")
+    if not out:
+        return []
+
+    rows = []
+    for line in out.splitlines():
+        rows.append(line.split("\t"))
+    return rows
+
+def _to_int(x):
+    if x is None:
+        return None
+    if x == r"\N" or x == "":
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def main():
+    import sys
+    mode = "yesterday"
+    if len(sys.argv) >= 2 and sys.argv[1].strip().lower() == "today":
+        mode = "today"
+
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in /opt/pasarguard-admin-report/.env")
+
+    db_name = _read_env_val(PASARGUARD_ENV, "DB_NAME") or "pasarguard"
+
+    start_dt, end_dt = tehran_range(mode)
+
+    # convert to UTC for querying TIMESTAMP reliably
+    start_utc = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Jalali date for the report day
+    j = jdatetime.date.fromgregorian(date=start_dt.date())
+    jalali = f"{j.year:04d}-{j.month:02d}-{j.day:02d}"
+
+    sql = f"""
+SET time_zone = '+00:00';
+SELECT
+  e.event_type,
+  e.admin_id,
+  COALESCE(a.username,'') AS admin_username,
+  COALESCE(e.username,'') AS username,
+  e.old_data_limit,
+  e.new_data_limit,
+  e.old_used,
+  e.new_used,
+  e.reported_at
+FROM admin_report_events e
+LEFT JOIN admins a ON a.id = e.admin_id
+WHERE e.reported_at >= '{start_utc:%Y-%m-%d %H:%M:%S}'
+  AND e.reported_at <  '{end_utc:%Y-%m-%d %H:%M:%S}'
+ORDER BY e.admin_id ASC, e.id ASC;
+""".strip()
+
+    rows = _mysql_rows(db_name, sql)
+
+    allowed = {
+        "USER_CREATED",
+        "DATA_LIMIT_CHANGED",
+        "UNLIMITED_CREATED",
+        "LIMIT_TO_UNLIMITED",
+        "UNLIMITED_TO_LIMIT",
+        "USAGE_RESET",
+    }
+
+    events = []
+    for r in rows:
+        # columns:
+        # 0 event_type, 1 admin_id, 2 admin_username, 3 username,
+        # 4 old_data_limit, 5 new_data_limit, 6 old_used, 7 new_used, 8 reported_at
+        event_type = r[0]
+        if event_type not in allowed:
+            continue
+        events.append({
+            "event_type": event_type,
+            "admin_id": _to_int(r[1]) or 0,
+            "admin_username": r[2] or "",
+            "username": r[3] or "",
+            "old_data_limit": _to_int(r[4]),
+            "new_data_limit": _to_int(r[5]),
+            "old_used": _to_int(r[6]),
+            "new_used": _to_int(r[7]),
+        })
+
+    if not events:
         return
-    conn = connect()
-    try:
-        with conn.cursor() as cur:
-            # chunk to avoid very large IN()
-            CHUNK = 500
-            for i in range(0, len(ids), CHUNK):
-                part = ids[i:i+CHUNK]
-                placeholders = ",".join(["%s"] * len(part))
-                cur.execute(f"UPDATE admin_report_events SET reported_at = NOW() WHERE id IN ({placeholders})", part)
-    finally:
-        conn.close()
-
-def build_messages(rows):
-    # only these affect “loss risk” / reporting
-    allowed = {"USER_CREATED", "DATA_LIMIT_CHANGED", "UNLIMITED_CREATED", "LIMIT_TO_UNLIMITED"}
-    if INCLUDE_RESETS:
-        allowed.add("USAGE_RESET")
-
-    rows = [r for r in rows if r.get("event_type") in allowed]
 
     by_admin = {}
-    for r in rows:
-        by_admin.setdefault(r.get("admin_id") or 0, []).append(r)
+    for e in events:
+        by_admin.setdefault(e["admin_id"], []).append(e)
 
-    messages = []  # list of (admin_id, text, used_event_ids)
     for admin_id, evs in by_admin.items():
-        admin_name = evs[0].get("admin_username") or f"admin_id={admin_id}"
+        admin_name = evs[0]["admin_username"] or f"admin_id={admin_id}"
 
-        user_state = {}  # username -> dict
-        used_ids = []
-
+        # username -> state
+        user_state = {}
         for e in evs:
-            used_ids.append(int(e["id"]))
-            u = e.get("username") or f"user_id={e.get('user_id')}"
-            st = user_state.setdefault(u, {"unlimited": False, "was_limit_bytes": None, "delta_bytes": 0, "reset": False})
+            u = e["username"] or "unknown"
+            st = user_state.setdefault(u, {"unlimited": False, "was_limit_bytes": None, "charge_bytes": 0})
 
             t = e["event_type"]
 
             if t == "UNLIMITED_CREATED":
                 st["unlimited"] = True
+                st["was_limit_bytes"] = None
                 continue
 
             if t == "LIMIT_TO_UNLIMITED":
                 st["unlimited"] = True
-                oldv = e.get("old_data_limit")
-                if oldv is not None:
-                    st["was_limit_bytes"] = int(oldv)
+                if e["old_data_limit"] is not None:
+                    st["was_limit_bytes"] = int(e["old_data_limit"])
+                continue
+
+            if t == "UNLIMITED_TO_LIMIT":
+                st["unlimited"] = False
                 continue
 
             if t == "USER_CREATED":
-                if e.get("new_data_limit") is None:
+                if e["new_data_limit"] is None:
                     st["unlimited"] = True
                 else:
-                    st["delta_bytes"] += int(e["new_data_limit"])
+                    st["charge_bytes"] += int(e["new_data_limit"])
                 continue
 
             if t == "DATA_LIMIT_CHANGED":
-                oldv = e.get("old_data_limit")
-                newv = e.get("new_data_limit")
+                oldv = e["old_data_limit"]
+                newv = e["new_data_limit"]
                 if oldv is None or newv is None:
-                    # conversions are handled by LIMIT_TO_UNLIMITED/UNLIMITED_TO_LIMIT triggers
+                    if newv is None:
+                        st["unlimited"] = True
+                        if oldv is not None:
+                            st["was_limit_bytes"] = int(oldv)
                     continue
-                delta = int(newv) - int(oldv)
-                # فقط افزایش‌ها را گزارش کن (کاهش ضرر نیست)
-                if delta > 0:
-                    st["delta_bytes"] += delta
+                diff = int(newv) - int(oldv)
+                if diff > 0:
+                    st["charge_bytes"] += diff
                 continue
 
             if t == "USAGE_RESET":
-                st["reset"] = True
+                if CHARGE_FULL_LIMIT_ON_RESET:
+                    limit_now = e["new_data_limit"]
+                    if limit_now is None:
+                        # reset on unlimited => no GB charge
+                        st["unlimited"] = True
+                    else:
+                        # charge FULL limit
+                        st["charge_bytes"] += int(limit_now)
+                else:
+                    old_used = e["old_used"] or 0
+                    if old_used > 0:
+                        st["charge_bytes"] += int(old_used)
                 continue
 
-        # message header date = based on first event day (digest range day)
-        # we'll fill date later from caller; here just return body
-        # We'll add date placeholder "{DATE}"
-        lines = [f"<b>{{DATE}}</b>", f"Admin: <b>{admin_name}</b>", ""]
-
-        total_pos_gb = 0.0
-        has_any = False
+        lines = [f"<b>{jalali}</b>", f"Admin: <b>{admin_name}</b>", ""]
+        total_gb = 0.0
+        any_line = False
 
         for u in sorted(user_state.keys()):
             st = user_state[u]
 
-            suffix = ""
-            if INCLUDE_RESETS and st["reset"]:
-                suffix = " | reset"
-
             if st["unlimited"]:
-                if SHOW_LIMIT_AFTER_UNLIMITED and st["was_limit_bytes"] is not None:
-                    was_gb = gb_from_bytes(st["was_limit_bytes"])
-                    lines.append(f"- {u}: unlimited (was {fmt_gb(was_gb)}){suffix}")
+                if SHOW_LIMIT_AFTER_UNLIMITED and st["was_limit_bytes"]:
+                    lines.append(f"- {u}: unlimited (was {fmt_gb(gb_from_bytes(st['was_limit_bytes']))})")
                 else:
-                    lines.append(f"- {u}: unlimited{suffix}")
-                has_any = True
+                    lines.append(f"- {u}: unlimited")
+                any_line = True
                 continue
 
-            delta = st["delta_bytes"]
-            if delta > 0:
-                g = gb_from_bytes(delta)
-                total_pos_gb += g
-                lines.append(f"- {u}: +{fmt_gb(g)}{suffix}")
-                has_any = True
-            else:
-                # only reset with no delta
-                if INCLUDE_RESETS and st["reset"]:
-                    lines.append(f"- {u}: reset")
-                    has_any = True
+            charge = st["charge_bytes"]
+            if charge <= 0:
+                continue
 
-        if not has_any:
+            g = gb_from_bytes(charge)
+            total_gb += g
+            lines.append(f"- {u}: +{fmt_gb(g)}")
+            any_line = True
+
+        if not any_line:
             continue
 
         lines.append("")
-        lines.append(f"Total: <b>{fmt_gb(total_pos_gb)}</b>")
+        lines.append(f"Total: <b>{fmt_gb(total_gb)}</b>")
 
-        messages.append((admin_id, "\n".join(lines), used_ids))
-
-    return messages
-
-def main():
-    import sys
-
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env")
-
-    mode = "yesterday"
-    override = False
-    dry_run = False
-
-    args = sys.argv[1:]
-    for a in args:
-        if a in ("today", "yesterday"):
-            mode = a
-        elif a in ("--override", "override"):
-            override = True
-        elif a in ("--dry-run", "dry"):
-            dry_run = True
-
-    start_dt, end_dt = _range_tehran(mode)
-    jalali = jalali_date_str(start_dt.date())
-
-    rows = fetch_events(start_dt, end_dt, override=override)
-    msgs = build_messages(rows)
-
-    if not msgs:
-        return
-
-    for _admin_id, text, ids in msgs:
-        text = text.replace("{DATE}", jalali)
-        if dry_run:
-            print(text)
-        else:
-            send(text)
-            time.sleep(0.4)
-            # mark as reported only if not override
-            if not override:
-                mark_reported(ids)
+        send("\n".join(lines))
+        time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
 PY
-}
 
-write_app_env() {
-  local tz="$1" token="$2" chat="$3" host="$4" port="$5" db="$6" user="$7" pass="$8"
-  cat > "${INSTALL_DIR}/.env" <<EOF
-# ${APP_NAME} config
-TIMEZONE=${tz}
+# -------- write app .env (clean, no duplication) --------
+cat >"$APP_DIR/.env" <<EOF
+TIMEZONE=${TIMEZONE}
+TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
+TELEGRAM_CHAT_ID=${CHAT_ID}
 
-# Telegram
-TELEGRAM_BOT_TOKEN=${token}
-TELEGRAM_CHAT_ID=${chat}
-
-# MySQL (PasarGuard database)
-MYSQL_HOST=${host}
-MYSQL_PORT=${port}
-MYSQL_DATABASE=${db}
-MYSQL_USER=${user}
-MYSQL_PASSWORD=${pass}
-
-# Report options
-INCLUDE_RESETS=1
+# Optional:
 SHOW_LIMIT_AFTER_UNLIMITED=1
+CHARGE_FULL_LIMIT_ON_RESET=1
+
+# Optional override:
+# MYSQL_CONTAINER=${MYSQL_CONTAINER}
+# PASARGUARD_ENV=${PASARGUARD_ENV_DEFAULT}
 EOF
-  chmod 600 "${INSTALL_DIR}/.env"
-}
+chmod 600 "$APP_DIR/.env"
 
-create_venv() {
-  info "Creating Python venv..."
-  python3 -m venv "${INSTALL_DIR}/.venv"
-  "${INSTALL_DIR}/.venv/bin/python" -m pip install --upgrade pip >/dev/null
-  "${INSTALL_DIR}/.venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt" >/dev/null
-  ok "Python deps installed."
-}
-
-apply_triggers() {
-  local container="$1" root_pass="$2" db_name="$3"
-  info "Applying triggers inside MySQL container: ${container} (db: ${db_name})"
-  # Use MYSQL_PWD env to avoid showing password in commandline history
-  docker exec -i -e MYSQL_PWD="${root_pass}" "${container}" mysql -uroot < "${INSTALL_DIR}/triggers.sql"
-  # verify
-  local out
-  out="$(docker exec -i -e MYSQL_PWD="${root_pass}" "${container}" mysql -uroot -N -B -e "USE \`${db_name}\`; SHOW TRIGGERS;" 2>/dev/null || true)"
-  echo "$out" | grep -q "trg_report_user_create" || die "Triggers not found after apply."
-  ok "Triggers applied."
-}
-
-install_cron() {
-  info "Installing cron (daily 00:00 ${DEFAULT_TZ})..."
-  local tmp
-  tmp="$(mktemp)"
-  # keep existing cron, remove our block if exists
-  (crontab -l 2>/dev/null || true) | sed '/BEGIN pasarguard-admin-report/,/END pasarguard-admin-report/d' > "$tmp"
-  {
-    echo "# BEGIN pasarguard-admin-report"
-    echo "${CRON_TIME} TZ=${DEFAULT_TZ} ${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/daily_digest.py >> ${LOG_FILE} 2>&1"
-    echo "# END pasarguard-admin-report"
-  } >> "$tmp"
-  crontab "$tmp"
-  rm -f "$tmp"
-  ok "Cron installed."
-}
-
-# ----------------------------
-# main
-# ----------------------------
-need_root
-require_cmd apt-get
-require_cmd curl
-require_cmd docker
-
-echo "======================================"
-echo "✅ ${APP_NAME} one-line installer"
-echo "======================================"
-
-install_packages
-
-[[ -f "${PASARGUARD_ENV}" ]] || die "PasarGuard env not found: ${PASARGUARD_ENV}"
-
-info "Found PasarGuard env: ${PASARGUARD_ENV}"
-
-MYSQL_ROOT_PASSWORD="$(read_env_value MYSQL_ROOT_PASSWORD "${PASARGUARD_ENV}")"
-[[ -n "${MYSQL_ROOT_PASSWORD}" ]] || die "MYSQL_ROOT_PASSWORD not found in ${PASARGUARD_ENV}"
-
-DB_NAME="$(read_env_value DB_NAME "${PASARGUARD_ENV}")"
-[[ -n "${DB_NAME}" ]] || DB_NAME="pasarguard"
-
-DB_HOST="$(read_env_value DB_HOST "${PASARGUARD_ENV}")"
-DB_PORT="$(read_env_value DB_PORT "${PASARGUARD_ENV}")"
-DB_USER="$(read_env_value DB_USER "${PASARGUARD_ENV}")"
-DB_PASS="$(read_env_value DB_PASS "${PASARGUARD_ENV}")"
-
-# Fall back to common keys if panel uses different naming
-[[ -n "${DB_USER}" ]] || DB_USER="$(read_env_value MYSQL_USER "${PASARGUARD_ENV}")"
-[[ -n "${DB_PASS}" ]] || DB_PASS="$(read_env_value MYSQL_PASSWORD "${PASARGUARD_ENV}")"
-
-[[ -n "${DB_HOST}" ]] || DB_HOST="127.0.0.1"
-[[ -n "${DB_PORT}" ]] || DB_PORT="3306"
-
-CONTAINER="$(detect_mysql_container)"
-if [[ -z "${CONTAINER}" ]]; then
-  warn "Could not auto-detect MySQL container."
-  docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Ports}}"
-  read -r -p "Enter MySQL container name: " CONTAINER
-  [[ -n "${CONTAINER}" ]] || die "No container provided."
+# -------- validate bot token --------
+echo "ℹ️  Validating Telegram bot token..."
+if ! curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" >/dev/null; then
+  echo "❌ Telegram token invalid (getMe failed)."
+  echo "   Fix token in $APP_DIR/.env then re-run daily_digest."
+  exit 1
 fi
-info "Detected MySQL container: ${CONTAINER}"
+echo "✅ Telegram token OK."
+echo "ℹ️  Telegram Bot Token (for confirmation): ${BOT_TOKEN}"
 
-# Create folder
-mkdir -p "${INSTALL_DIR}"
+# -------- create venv --------
+echo "ℹ️  Creating Python venv..."
+python3 -m venv "$APP_DIR/.venv"
+"$APP_DIR/.venv/bin/pip" install -U pip >/dev/null
+"$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" >/dev/null
+echo "✅ Python deps installed."
 
-# Ask for timezone + telegram
-TZ="$(prompt_default "Timezone" "${DEFAULT_TZ}")"
+# -------- apply triggers inside mysql container --------
+echo "ℹ️  Applying triggers inside MySQL container: $MYSQL_CONTAINER (db: $DB_NAME)"
+docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
+  mysql -uroot "$DB_NAME" < "$APP_DIR/triggers.sql"
+echo "✅ Triggers applied."
 
-# Telegram token loop with validation
-BOT_TOKEN=""
-BOT_USER=""
-while true; do
-  read -r -p "Telegram Bot Token: " BOT_TOKEN || true
-  BOT_TOKEN="${BOT_TOKEN//[[:space:]]/}"   # remove whitespace
-  [[ -n "${BOT_TOKEN}" ]] || { warn "Token cannot be empty."; continue; }
-  BOT_USER="$(validate_bot_token "${BOT_TOKEN}" || true)"
-  if [[ -n "${BOT_USER}" ]]; then
-    ok "Bot token is valid. Bot username: @${BOT_USER}"
-    # show token back (requested) — but still warn:
-    warn "Your Bot Token (keep it secret): ${BOT_TOKEN}"
-    break
-  fi
-  warn "Invalid Bot Token (getMe failed). Please paste again."
-done
+# -------- install cron (root) --------
+echo "ℹ️  Installing cron (daily 00:00 ${TIMEZONE})..."
+CRON_LINE="0 0 * * * TZ=${TIMEZONE} ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py >> /var/log/pasarguard-admin-report.log 2>&1"
+TMP_CRON="$(mktemp)"
 
-CHAT_ID="$(prompt_default "Telegram Chat ID" "")"
-[[ -n "${CHAT_ID// }" ]] || die "Chat ID cannot be empty."
+# keep existing root cron, remove old block, append new block
+( crontab -l 2>/dev/null || true ) | sed '/BEGIN pasarguard-admin-report/,/END pasarguard-admin-report/d' > "$TMP_CRON"
+{
+  echo "# BEGIN pasarguard-admin-report"
+  echo "$CRON_LINE"
+  echo "# END pasarguard-admin-report"
+} >> "$TMP_CRON"
+crontab "$TMP_CRON"
+rm -f "$TMP_CRON"
+echo "✅ Cron installed."
 
-# MySQL app credentials (for reading events)
-if [[ -z "${DB_USER}" || -z "${DB_PASS}" ]]; then
-  warn "DB_USER/DB_PASS not found in ${PASARGUARD_ENV}."
-  DB_USER="$(prompt_default "MySQL Username" "pasarguard")"
-  DB_PASS="$(prompt_secret "MySQL Password")"
-  [[ -n "${DB_PASS}" ]] || die "MySQL password cannot be empty."
-fi
-
-# Write files (self-contained install)
-write_requirements
-write_triggers_sql
-write_daily_digest_py
-write_app_env "${TZ}" "${BOT_TOKEN}" "${CHAT_ID}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" "${DB_USER}" "${DB_PASS}"
-
-create_venv
-apply_triggers "${CONTAINER}" "${MYSQL_ROOT_PASSWORD}" "${DB_NAME}"
-install_cron
-
-# create log file so tail works
-touch "${LOG_FILE}"
-chmod 600 "${LOG_FILE}"
-
-# Send install confirmation message (optional but helpful)
-info "Sending a test message to Telegram..."
-if send_test_message "${BOT_TOKEN}" "${CHAT_ID}" "✅ PasarGuard Admin Report installed.\nDaily digest scheduled at 00:00 (${TZ})."; then
-  ok "Telegram test message sent."
-else
-  warn "Could not send test message. Please check chat_id and bot permissions."
-fi
-
-ok "Installed!"
-info "Files: ${INSTALL_DIR}"
-info "Log:   ${LOG_FILE}"
+# -------- quick test message (optional) --------
+echo "ℹ️  Sending test message to Telegram..."
+curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${CHAT_ID}" \
+  -d "text=pasarguard-admin-report نصب شد ✅" >/dev/null || true
+echo "✅ Installed!"
+echo "ℹ️  Files: $APP_DIR"
+echo "ℹ️  Log:   /var/log/pasarguard-admin-report.log"
 echo
-info "Test now (prints nothing if no events):"
-echo "  ${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/daily_digest.py today --override"
+echo "ℹ️  Test now (today mode):"
+echo "  ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py today"
 echo
-info "Config:"
-echo "  ${INSTALL_DIR}/.env"
+echo "ℹ️  Default cron sends yesterday digest at 00:00 ${TIMEZONE}."
+echo "======================================"
