@@ -598,7 +598,8 @@ TMP_CRON="$(mktemp)"
 {
   echo "# BEGIN pasarguard-admin-report"
   echo "SHELL=/bin/bash"
-  echo "TZ=${TIMEZONE}"
+  echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  echo "CRON_TZ=${TIMEZONE}"
   echo "0 0 * * * ${CRON_CMD}"
   echo "# END pasarguard-admin-report"
 } >> "$TMP_CRON"
@@ -608,6 +609,7 @@ rm -f "$TMP_CRON"
 systemctl enable cron >/dev/null 2>&1 || true
 systemctl restart cron >/dev/null 2>&1 || true
 echo "✅ Cron installed."
+
 
 echo "ℹ️  Sending test message..."
 curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
