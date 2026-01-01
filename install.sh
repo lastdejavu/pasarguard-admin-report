@@ -16,12 +16,24 @@ LOG_FILE="/var/log/pasarguard-admin-report.log"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+trim() { echo -n "${1:-}" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'; }
+
+# Read KEY from .env files robustly (supports: KEY=V or KEY = V, optional quotes)
 read_env_val() {
   local key="$1" file="$2"
-  grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | cut -d= -f2- || true
+  local line val
+  line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null | head -n1 || true)"
+  if [[ -z "$line" ]]; then
+    echo -n ""
+    return 0
+  fi
+  val="$(echo -n "$line" | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//")"
+  val="$(echo -n "$val" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  # strip surrounding quotes if present
+  val="$(echo -n "$val" | sed -E 's/^"(.*)"$/\1/')"
+  val="$(echo -n "$val" | sed -E "s/^'(.*)'\$/\1/")"
+  echo -n "$val"
 }
-
-trim() { echo -n "${1:-}" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'; }
 
 # Read from tty even when script is piped (curl | sudo bash)
 tty_read() {
@@ -45,17 +57,13 @@ tty_read() {
   printf -v "$varname" "%s" "$val"
 }
 
-is_valid_token() {
-  [[ "${1:-}" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]
-}
-is_valid_chat_id() {
-  [[ "${1:-}" =~ ^-?[0-9]+$ ]]
-}
+is_valid_token() { [[ "${1:-}" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]; }
+is_valid_chat_id() { [[ "${1:-}" =~ ^-?[0-9]+$ ]]; }
 
-echo "ℹ️  Installing packages (python3, venv, cron, curl, ca-certificates)..."
+echo "ℹ️  Installing packages (python3, venv, cron, curl, ca-certificates, tzdata)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
-apt-get install -y python3 python3-venv python3-pip cron curl ca-certificates >/dev/null
+apt-get install -y python3 python3-venv python3-pip cron curl ca-certificates tzdata >/dev/null
 echo "✅ Packages installed."
 
 if ! need_cmd docker; then
@@ -98,6 +106,12 @@ fi
 echo "ℹ️  Detected MySQL container: $MYSQL_CONTAINER"
 echo "ℹ️  DB name: $DB_NAME"
 
+# Smoke test MySQL root password / container access
+echo "ℹ️  Testing MySQL access inside container..."
+docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
+  mysql -uroot "$DB_NAME" -e "SELECT 1;" >/dev/null
+echo "✅ MySQL access OK."
+
 TIMEZONE="${TIMEZONE:-Asia/Tehran}"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -109,7 +123,7 @@ if [[ -f "$APP_DIR/.env" ]]; then
   prev_tz="$(trim "$(read_env_val TIMEZONE "$APP_DIR/.env")")"
   [[ -z "$BOT_TOKEN" ]] && BOT_TOKEN="$prev_bot"
   [[ -z "$CHAT_ID" ]] && CHAT_ID="$prev_chat"
-  [[ "${TIMEZONE:-}" == "Asia/Tehran" && -n "$prev_tz" ]] && TIMEZONE="$prev_tz"
+  [[ "${TIMEZONE:-Asia/Tehran}" == "Asia/Tehran" && -n "$prev_tz" ]] && TIMEZONE="$prev_tz"
 fi
 
 if [[ -z "$BOT_TOKEN" ]]; then
@@ -184,25 +198,6 @@ SET @sql := IF(
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
-
--- If older installs used created_at, best-effort copy
-SET @has_created_at := (
-  SELECT COUNT(*)
-  FROM information_schema.COLUMNS
-  WHERE TABLE_SCHEMA = DATABASE()
-    AND TABLE_NAME = 'admin_report_events'
-    AND COLUMN_NAME = 'created_at'
-);
-
-SET @sql2 := IF(
-  @has_created_at > 0,
-  'UPDATE admin_report_events SET reported_at = created_at WHERE reported_at IS NULL',
-  'SELECT 1'
-);
-
-PREPARE stmt2 FROM @sql2;
-EXECUTE stmt2;
-DEALLOCATE PREPARE stmt2;
 
 DELIMITER $$
 
@@ -299,42 +294,63 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 APP_ENV = "/opt/pasarguard-admin-report/.env"
-PASARGUARD_ENV = os.getenv("PASARGUARD_ENV", "/opt/pasarguard/.env")
 
-load_dotenv(APP_ENV)
+# IMPORTANT: load our .env FIRST so PASARGUARD_ENV / MYSQL_CONTAINER overrides work.
+load_dotenv(APP_ENV, override=True)
 
-TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tehran"))
+TIMEZONE_STR = (os.getenv("TIMEZONE", "Asia/Tehran") or "Asia/Tehran").strip() or "Asia/Tehran"
+TZ = ZoneInfo(TIMEZONE_STR)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
 
-MYSQL_CONTAINER = os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1").strip()
+PASARGUARD_ENV = (os.getenv("PASARGUARD_ENV", "/opt/pasarguard/.env") or "/opt/pasarguard/.env").strip() or "/opt/pasarguard/.env"
+MYSQL_CONTAINER = (os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1") or "pasarguard-mysql-1").strip() or "pasarguard-mysql-1"
 
-SHOW_LIMIT_AFTER_UNLIMITED = os.getenv("SHOW_LIMIT_AFTER_UNLIMITED", "1") == "1"
-CHARGE_FULL_LIMIT_ON_RESET = os.getenv("CHARGE_FULL_LIMIT_ON_RESET", "1") == "1"
+SHOW_LIMIT_AFTER_UNLIMITED = (os.getenv("SHOW_LIMIT_AFTER_UNLIMITED", "1") or "1").strip() == "1"
+CHARGE_FULL_LIMIT_ON_RESET = (os.getenv("CHARGE_FULL_LIMIT_ON_RESET", "1") or "1").strip() == "1"
+DEBUG = (os.getenv("DEBUG", "0") or "0").strip() == "1"
+DRY_RUN = (os.getenv("DRY_RUN", "0") or "0").strip() == "1"
 
-DEBUG = os.getenv("DEBUG", "0") == "1"
+def log(msg: str) -> None:
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts} {TIMEZONE_STR}] {msg}", flush=True)
 
 def _read_env_val(path: str, key: str) -> str:
+    # Supports: KEY=VAL and KEY = VAL, optional quotes.
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith(key + "="):
-                    return line.split("=", 1)[1].strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() != key:
+                    continue
+                v = v.strip().strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                return v.strip()
     except FileNotFoundError:
         return ""
     return ""
 
 def send(text: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, data={
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }, timeout=20)
-    r.raise_for_status()
+    r = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
+        timeout=20,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram API error {r.status_code}: {r.text}")
+    # Telegram returns ok/false with 200 sometimes, but for bad chat_id it is usually 400.
+    # Still keep it simple here.
 
 def gb_from_bytes(n: int) -> float:
     return n / (1024**3)
@@ -361,18 +377,18 @@ def _mysql_rows(db: str, sql: str):
         MYSQL_CONTAINER,
         "mysql",
         "-uroot",
+        "-A",              # faster (no auto-rehash)
         "-N", "-B", "--raw",
         db,
         "-e", sql
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or "mysql exec failed")
 
     out = p.stdout.strip("\n")
     if not out:
         return []
-
     return [line.split("\t") for line in out.splitlines()]
 
 def _to_int(x):
@@ -386,11 +402,19 @@ def _to_int(x):
 def main():
     import sys
     mode = "yesterday"
-    if len(sys.argv) >= 2 and sys.argv[1].strip().lower() == "today":
-        mode = "today"
+    dry_run = DRY_RUN
+    debug = DEBUG
 
-    if DEBUG:
-        print("MODE:", mode)
+    for arg in sys.argv[1:]:
+        a = arg.strip().lower()
+        if a in ("today", "--today"):
+            mode = "today"
+        elif a in ("yesterday", "--yesterday"):
+            mode = "yesterday"
+        elif a in ("--dry-run", "dry-run", "--dryrun"):
+            dry_run = True
+        elif a in ("--debug", "debug"):
+            debug = True
 
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in /opt/pasarguard-admin-report/.env")
@@ -402,12 +426,6 @@ def main():
     # Convert boundaries to UTC for querying reported_at (UTC)
     start_utc = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-    if DEBUG:
-        print("Tehran start:", start_dt)
-        print("Tehran end  :", end_dt)
-        print("UTC start   :", start_utc)
-        print("UTC end     :", end_utc)
 
     # Jalali report date (based on start_dt day)
     j = jdatetime.date.fromgregorian(date=start_dt.date())
@@ -424,8 +442,7 @@ SELECT
   e.old_data_limit,
   e.new_data_limit,
   e.old_used,
-  e.new_used,
-  e.reported_at
+  e.new_used
 FROM admin_report_events e
 LEFT JOIN admins a ON a.id = e.admin_id
 WHERE e.reported_at >= '{start_utc:%Y-%m-%d %H:%M:%S}'
@@ -434,8 +451,12 @@ ORDER BY e.admin_id ASC, e.id ASC;
 """.strip()
 
     rows = _mysql_rows(db_name, sql)
-    if DEBUG:
-        print("Rows:", len(rows))
+
+    if debug:
+        log(f"MODE={mode} DRY_RUN={dry_run}")
+        log(f"Tehran range: {start_dt} -> {end_dt}")
+        log(f"UTC    range: {start_utc} -> {end_utc}")
+        log(f"Rows fetched: {len(rows)}")
 
     allowed = {
         "USER_CREATED",
@@ -463,11 +484,15 @@ ORDER BY e.admin_id ASC, e.id ASC;
         })
 
     if not events:
-        return  # no message => not noisy
+        # IMPORTANT: log once so users know it ran
+        log(f"No events for {jalali} ({mode}).")
+        return
 
     by_admin = {}
     for e in events:
         by_admin.setdefault(e["admin_id"], []).append(e)
+
+    sent = 0
 
     for admin_id, evs in by_admin.items():
         admin_name = evs[0]["admin_username"] or f"admin_id={admin_id}"
@@ -553,13 +578,23 @@ ORDER BY e.admin_id ASC, e.id ASC;
             any_line = True
 
         if not any_line:
+            if debug:
+                log(f"No printable lines for admin_id={admin_id}")
             continue
 
         lines.append("")
         lines.append(f"Total: <b>{fmt_gb(total_gb)}</b>")
 
-        send("\n".join(lines))
-        time.sleep(0.5)
+        msg = "\n".join(lines)
+
+        if dry_run:
+            log(f"DRY RUN message for {admin_name}:\n{msg}")
+        else:
+            send(msg)
+            sent += 1
+            time.sleep(0.5)
+
+    log(f"Done. admins={len(by_admin)} messages_sent={sent} mode={mode} date={jalali}")
 
 if __name__ == "__main__":
     main()
@@ -580,13 +615,9 @@ PASARGUARD_ENV=${PASARGUARD_ENV}
 EOF
 chmod 600 "$APP_DIR/.env"
 
-echo "ℹ️  Validating Telegram bot token..."
-if ! curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" >/dev/null; then
-  echo "❌ Telegram token invalid (getMe failed)."
-  exit 1
-fi
+echo "ℹ️  Validating Telegram bot token (getMe)..."
+curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" >/dev/null
 echo "✅ Telegram token OK."
-echo "ℹ️  Bot token (confirmation): ${BOT_TOKEN}"
 
 echo "ℹ️  Creating Python venv..."
 python3 -m venv "$APP_DIR/.venv"
@@ -603,20 +634,15 @@ echo "ℹ️  Installing cron (daily 00:00 ${TIMEZONE})..."
 touch "$LOG_FILE"
 chmod 644 "$LOG_FILE"
 
-CRON_CMD="${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py >> ${LOG_FILE} 2>&1"
+CRON_JOB="0 0 * * * cd ${APP_DIR} && PYTHONUNBUFFERED=1 ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py >> ${LOG_FILE} 2>&1"
 TMP_CRON="$(mktemp)"
 
-# 1) Take existing crontab
-# 2) Remove our old block
-# 3) Append global env vars FIRST (SHELL/PATH/CRON_TZ), then our block
-( crontab -l 2>/dev/null || true ) | sed '/BEGIN pasarguard-admin-report/,/END pasarguard-admin-report/d' > "$TMP_CRON"
+( crontab -l 2>/dev/null || true ) | sed '/^# BEGIN pasarguard-admin-report$/,/^# END pasarguard-admin-report$/d' > "$TMP_CRON"
 
 {
-  echo "SHELL=/bin/bash"
-  echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-  echo "CRON_TZ=${TIMEZONE}"
   echo "# BEGIN pasarguard-admin-report"
-  echo "0 0 * * * ${CRON_CMD}"
+  echo "CRON_TZ=${TIMEZONE}"
+  echo "${CRON_JOB}"
   echo "# END pasarguard-admin-report"
 } >> "$TMP_CRON"
 
@@ -630,14 +656,18 @@ echo "✅ Cron installed."
 echo "ℹ️  Sending test message..."
 curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
   -d "chat_id=${CHAT_ID}" \
-  -d "text=pasarguard-admin-report نصب شد ✅" >/dev/null || true
+  -d "text=pasarguard-admin-report نصب شد ✅" >/dev/null
+echo "✅ Test message sent."
 
 echo "✅ Installed!"
 echo "ℹ️  Files: $APP_DIR"
 echo "ℹ️  Log:   $LOG_FILE"
 echo
-echo "ℹ️  Test now (today mode):"
-echo "  ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py today"
+echo "ℹ️  Test now (today mode, debug):"
+echo "  DEBUG=1 ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py today"
+echo
+echo "ℹ️  Dry-run (prints message to log/terminal, no Telegram):"
+echo "  DRY_RUN=1 DEBUG=1 ${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py today"
 echo
 echo "ℹ️  Default cron sends YESTERDAY digest at 00:00 ${TIMEZONE}."
 echo "======================================"
