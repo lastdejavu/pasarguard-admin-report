@@ -35,7 +35,9 @@ tty_read() {
     fi
     IFS= read -r val </dev/tty || true
   else
-    echo "❌ No /dev/tty available. Run interactively or pass env vars TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+    echo "❌ No /dev/tty available."
+    echo "   Run interactively OR pass env vars:"
+    echo "   TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... curl ... | sudo -E bash"
     exit 1
   fi
   val="$(trim "${val:-}")"
@@ -44,10 +46,10 @@ tty_read() {
 }
 
 is_valid_token() {
-  [[ "$1" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]
+  [[ "${1:-}" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]
 }
 is_valid_chat_id() {
-  [[ "$1" =~ ^-?[0-9]+$ ]]
+  [[ "${1:-}" =~ ^-?[0-9]+$ ]]
 }
 
 echo "ℹ️  Installing packages (python3, venv, cron, curl, ca-certificates)..."
@@ -86,11 +88,13 @@ if [[ -z "$MYSQL_CONTAINER" ]]; then
     MYSQL_CONTAINER="$(docker ps --format '{{.Names}} {{.Image}}' | awk 'tolower($0) ~ /mysql/ {print $1; exit}')"
   fi
 fi
+
 if [[ -z "$MYSQL_CONTAINER" ]]; then
   echo "❌ Could not detect MySQL container. Set MYSQL_CONTAINER=... and re-run."
   docker ps --format "table {{.Names}}\t{{.Image}}"
   exit 1
 fi
+
 echo "ℹ️  Detected MySQL container: $MYSQL_CONTAINER"
 echo "ℹ️  DB name: $DB_NAME"
 
@@ -108,7 +112,6 @@ if [[ -f "$APP_DIR/.env" ]]; then
   [[ "${TIMEZONE:-}" == "Asia/Tehran" && -n "$prev_tz" ]] && TIMEZONE="$prev_tz"
 fi
 
-# Ask via /dev/tty if missing
 if [[ -z "$BOT_TOKEN" ]]; then
   tty_read "Telegram Bot Token" BOT_TOKEN ""
 fi
@@ -121,7 +124,7 @@ CHAT_ID="$(trim "$CHAT_ID")"
 
 if ! is_valid_token "$BOT_TOKEN"; then
   echo "❌ Telegram Bot Token format looks wrong."
-  echo "   Tip: it must look like: 123456789:AA...."
+  echo "   Example: 123456789:AA...."
   exit 1
 fi
 if ! is_valid_chat_id "$CHAT_ID"; then
@@ -270,8 +273,7 @@ BEGIN
 
   -- usage reset: if used decreases
   IF (OLD.used_traffic > NEW.used_traffic) THEN
-    -- POLICY:
-    -- charge FULL current limit on reset (store current limit in new_data_limit)
+    -- POLICY: charge FULL current limit on reset (store current limit in new_data_limit)
     INSERT INTO admin_report_events(
       event_type, admin_id, user_id, username,
       new_data_limit, old_used, new_used, reported_at
@@ -310,6 +312,8 @@ MYSQL_CONTAINER = os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1").strip()
 
 SHOW_LIMIT_AFTER_UNLIMITED = os.getenv("SHOW_LIMIT_AFTER_UNLIMITED", "1") == "1"
 CHARGE_FULL_LIMIT_ON_RESET = os.getenv("CHARGE_FULL_LIMIT_ON_RESET", "1") == "1"
+
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 def _read_env_val(path: str, key: str) -> str:
     try:
@@ -385,6 +389,9 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1].strip().lower() == "today":
         mode = "today"
 
+    if DEBUG:
+        print("MODE:", mode)
+
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in /opt/pasarguard-admin-report/.env")
 
@@ -395,6 +402,12 @@ def main():
     # Convert boundaries to UTC for querying reported_at (UTC)
     start_utc = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if DEBUG:
+        print("Tehran start:", start_dt)
+        print("Tehran end  :", end_dt)
+        print("UTC start   :", start_utc)
+        print("UTC end     :", end_utc)
 
     # Jalali report date (based on start_dt day)
     j = jdatetime.date.fromgregorian(date=start_dt.date())
@@ -421,6 +434,8 @@ ORDER BY e.admin_id ASC, e.id ASC;
 """.strip()
 
     rows = _mysql_rows(db_name, sql)
+    if DEBUG:
+        print("Rows:", len(rows))
 
     allowed = {
         "USER_CREATED",
@@ -433,7 +448,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
 
     events = []
     for r in rows:
-        # 0 id, 1 event_type, 2 admin_id, 3 admin_username, 4 username, 5 old_data_limit, 6 new_data_limit, 7 old_used, 8 new_used, 9 reported_at
         event_type = r[1]
         if event_type not in allowed:
             continue
@@ -458,7 +472,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
     for admin_id, evs in by_admin.items():
         admin_name = evs[0]["admin_username"] or f"admin_id={admin_id}"
 
-        # username -> state
         user_state = {}
         for e in evs:
             u = e["username"] or "unknown"
@@ -503,7 +516,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
                 continue
 
             if t == "USAGE_RESET":
-                # Your policy: on reset, charge FULL limit (not used amount)
                 if CHARGE_FULL_LIMIT_ON_RESET:
                     limit_now = e["new_data_limit"]
                     if limit_now is None:
@@ -594,22 +606,26 @@ chmod 644 "$LOG_FILE"
 CRON_CMD="${APP_DIR}/.venv/bin/python ${APP_DIR}/daily_digest.py >> ${LOG_FILE} 2>&1"
 TMP_CRON="$(mktemp)"
 
+# 1) Take existing crontab
+# 2) Remove our old block
+# 3) Append global env vars FIRST (SHELL/PATH/CRON_TZ), then our block
 ( crontab -l 2>/dev/null || true ) | sed '/BEGIN pasarguard-admin-report/,/END pasarguard-admin-report/d' > "$TMP_CRON"
+
 {
-  echo "# BEGIN pasarguard-admin-report"
   echo "SHELL=/bin/bash"
   echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   echo "CRON_TZ=${TIMEZONE}"
+  echo "# BEGIN pasarguard-admin-report"
   echo "0 0 * * * ${CRON_CMD}"
   echo "# END pasarguard-admin-report"
 } >> "$TMP_CRON"
+
 crontab "$TMP_CRON"
 rm -f "$TMP_CRON"
 
 systemctl enable cron >/dev/null 2>&1 || true
 systemctl restart cron >/dev/null 2>&1 || true
 echo "✅ Cron installed."
-
 
 echo "ℹ️  Sending test message..."
 curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
