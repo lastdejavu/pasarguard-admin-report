@@ -5,9 +5,6 @@ echo "======================================"
 echo "✅ pasarguard-admin-report one-line installer"
 echo "======================================"
 
-# ----------------------------
-# Args
-# ----------------------------
 NON_INTERACTIVE=0
 for arg in "${@:-}"; do
   case "$arg" in
@@ -21,9 +18,6 @@ for arg in "${@:-}"; do
   esac
 done
 
-# ----------------------------
-# Root check
-# ----------------------------
 if [[ "${EUID:-0}" -ne 0 ]]; then
   echo "❌ Please run as root (use sudo)."
   exit 1
@@ -36,14 +30,6 @@ LOG_FILE="/var/log/pasarguard-admin-report.log"
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 trim() { echo -n "${1:-}" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//'; }
 
-mask() {
-  local s="${1:-}"
-  local n=${#s}
-  if (( n <= 12 )); then echo "***"; return; fi
-  echo "${s:0:6}...${s: -4}"
-}
-
-# Read KEY=VALUE from env-like file, supports optional spaces + optional quotes
 read_env_val() {
   local key="$1" file="$2"
   local line val
@@ -51,7 +37,6 @@ read_env_val() {
   [[ -z "$line" ]] && { echo -n ""; return 0; }
   val="$(echo -n "$line" | sed -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//")"
   val="$(trim "$val")"
-  # strip surrounding quotes if any
   val="$(echo -n "$val" | sed -E 's/^"(.*)"$/\1/; s/^\x27(.*)\x27$/\1/')"
   echo -n "$val"
 }
@@ -62,7 +47,7 @@ tty_read() {
 
   if [[ ! -r /dev/tty ]]; then
     echo "❌ No /dev/tty available."
-    echo "   Run interactively OR pass env vars:"
+    echo "   Run with env vars (non-interactive):"
     echo "   TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... curl ... | sudo -E bash -- --non-interactive"
     exit 1
   fi
@@ -73,7 +58,7 @@ tty_read() {
     printf "%s: " "$prompt" >/dev/tty
   fi
 
-  # hide token input
+  # Hide token input
   if echo "$prompt" | grep -qi "token"; then
     IFS= read -r -s val </dev/tty || true
     printf "\n" >/dev/tty
@@ -89,23 +74,17 @@ tty_read() {
 is_valid_token() { [[ "${1:-}" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]; }
 is_valid_chat_id() { [[ "${1:-}" =~ ^-?[0-9]+$ ]]; }
 
-# ----------------------------
-# Packages
-# ----------------------------
 echo "ℹ️  Installing packages (python3, venv, cron, curl, ca-certificates, tzdata)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y python3 python3-venv python3-pip cron curl ca-certificates tzdata >/dev/null
 echo "✅ Packages installed."
 
-# ----------------------------
-# Docker check
-# ----------------------------
-need_cmd docker || { echo "❌ Docker not found. PasarGuard must be installed via Docker."; exit 1; }
+if ! need_cmd docker; then
+  echo "❌ Docker not found. PasarGuard must be installed via Docker."
+  exit 1
+fi
 
-# ----------------------------
-# Pasarguard env
-# ----------------------------
 PASARGUARD_ENV="${PASARGUARD_ENV:-$PASARGUARD_ENV_DEFAULT}"
 if [[ ! -f "$PASARGUARD_ENV" ]]; then
   echo "❌ PasarGuard env not found at: $PASARGUARD_ENV"
@@ -123,9 +102,6 @@ if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
   exit 1
 fi
 
-# ----------------------------
-# Detect mysql container
-# ----------------------------
 MYSQL_CONTAINER="${MYSQL_CONTAINER:-}"
 if [[ -z "$MYSQL_CONTAINER" ]]; then
   if docker ps --format '{{.Names}}' | grep -qx 'pasarguard-mysql-1'; then
@@ -144,14 +120,12 @@ fi
 echo "ℹ️  Detected MySQL container: $MYSQL_CONTAINER"
 echo "ℹ️  DB name: $DB_NAME"
 
-# ----------------------------
-# Test MySQL access (FIXED: show errors)
-# ----------------------------
+# ✅ FIX: DO NOT USE `docker exec -i` here (it will consume stdin when running via pipe)
 echo "ℹ️  Testing MySQL access inside container..."
 MYSQL_TEST_OUT="$(
   set +e
-  docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
-    mysql -uroot "$DB_NAME" -e "SELECT 1;" 2>&1
+  docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
+    mysql -uroot "$DB_NAME" -e "SELECT 1;" </dev/null 2>&1
   echo "RC=$?"
 )"
 RC="$(echo "$MYSQL_TEST_OUT" | tail -n1 | sed -E 's/^RC=//')"
@@ -160,41 +134,33 @@ if [[ "${RC:-1}" != "0" ]]; then
   echo "--------------------------------------"
   echo "$MYSQL_TEST_OUT" | sed '$d'
   echo "--------------------------------------"
-  echo "Tip: run this to debug:"
-  echo "  docker exec -it -e MYSQL_PWD='***' $MYSQL_CONTAINER mysql -uroot $DB_NAME"
   exit 1
 fi
 echo "✅ MySQL access OK."
 
-# ----------------------------
-# Telegram config
-# ----------------------------
 TIMEZONE="${TIMEZONE:-Asia/Tehran}"
 BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Telegram settings"
-echo "• Interactive: installer will ask for token & chat_id"
-echo "• Non-interactive (recommended one-liner):"
-echo "  TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... curl ... | sudo -E bash -- --non-interactive"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo
-
 if [[ "$NON_INTERACTIVE" == "1" ]]; then
   if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
     echo "❌ Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID."
-    echo "Provide them like:"
+    echo "Use:"
     echo "  TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... curl ... | sudo -E bash -- --non-interactive"
     exit 1
   fi
 else
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Telegram setup"
+  echo "If it looks 'stuck', it's waiting for you to paste token/chat_id."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
   if [[ -z "$BOT_TOKEN" ]]; then
-    tty_read "Telegram Bot Token (paste and press Enter)" BOT_TOKEN ""
+    tty_read "Telegram Bot Token" BOT_TOKEN ""
   fi
   if [[ -z "$CHAT_ID" ]]; then
-    tty_read "Telegram Chat ID (number, e.g. 6762... or -100...)" CHAT_ID ""
+    tty_read "Telegram Chat ID (number)" CHAT_ID ""
   fi
 fi
 
@@ -207,13 +173,10 @@ if ! is_valid_token "$BOT_TOKEN"; then
   exit 1
 fi
 if ! is_valid_chat_id "$CHAT_ID"; then
-  echo "❌ Telegram Chat ID must be numeric."
+  echo "❌ Telegram Chat ID must be a number (like 6762... or -100...)."
   exit 1
 fi
 
-# ----------------------------
-# Create app dir
-# ----------------------------
 mkdir -p "$APP_DIR"
 chmod 700 "$APP_DIR"
 
@@ -223,32 +186,23 @@ python-dotenv==1.0.1
 jdatetime==5.0.0
 REQ
 
-# ----------------------------
-# triggers.sql
-# ----------------------------
 cat >"$APP_DIR/triggers.sql" <<'SQL'
 CREATE TABLE IF NOT EXISTS admin_report_events (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   event_type VARCHAR(64) NOT NULL,
-
   admin_id BIGINT NULL,
   user_id  BIGINT NULL,
   username VARCHAR(255) NULL,
-
   old_data_limit BIGINT NULL,
   new_data_limit BIGINT NULL,
-
   old_used BIGINT NULL,
   new_used BIGINT NULL,
-
   reported_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
   INDEX idx_reported_at (reported_at),
   INDEX idx_admin_time (admin_id, reported_at),
   INDEX idx_user_time (user_id, reported_at)
 );
 
--- Migration: if reported_at missing in old installs
 SET @has_reported_at := (
   SELECT COUNT(*)
   FROM information_schema.COLUMNS
@@ -300,7 +254,6 @@ CREATE TRIGGER trg_report_user_update
 AFTER UPDATE ON users
 FOR EACH ROW
 BEGIN
-  -- limited -> unlimited
   IF (OLD.data_limit IS NOT NULL AND NEW.data_limit IS NULL) THEN
     INSERT INTO admin_report_events(
       event_type, admin_id, user_id, username,
@@ -311,7 +264,6 @@ BEGIN
       OLD.data_limit, NULL, OLD.used_traffic, NEW.used_traffic, UTC_TIMESTAMP()
     );
 
-  -- unlimited -> limited
   ELSEIF (OLD.data_limit IS NULL AND NEW.data_limit IS NOT NULL) THEN
     INSERT INTO admin_report_events(
       event_type, admin_id, user_id, username,
@@ -322,7 +274,6 @@ BEGIN
       NULL, NEW.data_limit, OLD.used_traffic, NEW.used_traffic, UTC_TIMESTAMP()
     );
 
-  -- limited -> limited (limit changed)
   ELSEIF (OLD.data_limit <> NEW.data_limit) THEN
     INSERT INTO admin_report_events(
       event_type, admin_id, user_id, username,
@@ -334,7 +285,6 @@ BEGIN
     );
   END IF;
 
-  -- usage reset: if used decreases
   IF (OLD.used_traffic > NEW.used_traffic) THEN
     INSERT INTO admin_report_events(
       event_type, admin_id, user_id, username,
@@ -350,9 +300,6 @@ END $$
 DELIMITER ;
 SQL
 
-# ----------------------------
-# daily_digest.py (adds DRY_RUN)
-# ----------------------------
 cat >"$APP_DIR/daily_digest.py" <<'PY'
 import os
 import time
@@ -369,7 +316,6 @@ PASARGUARD_ENV = os.getenv("PASARGUARD_ENV", "/opt/pasarguard/.env")
 load_dotenv(APP_ENV, override=True)
 
 TZ = ZoneInfo((os.getenv("TIMEZONE", "Asia/Tehran").strip() or "Asia/Tehran"))
-
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MYSQL_CONTAINER = (os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1").strip() or "pasarguard-mysql-1")
@@ -377,8 +323,6 @@ MYSQL_CONTAINER = (os.getenv("MYSQL_CONTAINER", "pasarguard-mysql-1").strip() or
 SHOW_LIMIT_AFTER_UNLIMITED = os.getenv("SHOW_LIMIT_AFTER_UNLIMITED", "1") == "1"
 CHARGE_FULL_LIMIT_ON_RESET = os.getenv("CHARGE_FULL_LIMIT_ON_RESET", "1") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
-
-# NEW:
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 SEND_EMPTY = os.getenv("SEND_EMPTY", "0") == "1"
 
@@ -399,7 +343,6 @@ def send(text: str) -> None:
         print(text)
         print("----- DRY_RUN MESSAGE END -----")
         return
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = requests.post(url, data={
         "chat_id": CHAT_ID,
@@ -447,9 +390,7 @@ def _mysql_rows(db: str, sql: str):
     return [line.split("\t") for line in out.splitlines()]
 
 def _to_int(x):
-    if x is None:
-        return None
-    if x == r"\N" or x == "":
+    if x is None or x == r"\N" or x == "":
         return None
     try:
         return int(x)
@@ -466,10 +407,8 @@ def main():
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in /opt/pasarguard-admin-report/.env")
 
     db_name = _read_env_val(PASARGUARD_ENV, "DB_NAME") or "pasarguard"
-
     start_dt, end_dt = tehran_range(mode)
 
-    # Convert boundaries to UTC for querying reported_at (stored as UTC_TIMESTAMP() in triggers)
     start_utc = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -516,11 +455,10 @@ ORDER BY e.admin_id ASC, e.id ASC;
 
     events = []
     for r in rows:
-        event_type = r[1]
-        if event_type not in allowed:
+        if r[1] not in allowed:
             continue
         events.append({
-            "event_type": event_type,
+            "event_type": r[1],
             "admin_id": _to_int(r[2]) or 0,
             "admin_username": r[3] or "",
             "username": r[4] or "",
@@ -546,7 +484,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
         for e in evs:
             u = e["username"] or "unknown"
             st = user_state.setdefault(u, {"unlimited": False, "was_limit_bytes": None, "charge_bytes": 0})
-
             t = e["event_type"]
 
             if t == "UNLIMITED_CREATED":
@@ -572,8 +509,7 @@ ORDER BY e.admin_id ASC, e.id ASC;
                 continue
 
             if t == "DATA_LIMIT_CHANGED":
-                oldv = e["old_data_limit"]
-                newv = e["new_data_limit"]
+                oldv, newv = e["old_data_limit"], e["new_data_limit"]
                 if oldv is None or newv is None:
                     if newv is None:
                         st["unlimited"] = True
@@ -606,10 +542,7 @@ ORDER BY e.admin_id ASC, e.id ASC;
             st = user_state[u]
 
             if st["unlimited"]:
-                if SHOW_LIMIT_AFTER_UNLIMITED and st["was_limit_bytes"]:
-                    lines.append(f"- {u}: unlimited (was {fmt_gb(gb_from_bytes(st['was_limit_bytes']))})")
-                else:
-                    lines.append(f"- {u}: unlimited")
+                lines.append(f"- {u}: unlimited")
                 any_line = True
                 continue
 
@@ -627,7 +560,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
 
         lines.append("")
         lines.append(f"Total: <b>{fmt_gb(total_gb)}</b>")
-
         send("\n".join(lines))
         time.sleep(0.5)
 
@@ -635,9 +567,6 @@ if __name__ == "__main__":
     main()
 PY
 
-# ----------------------------
-# Write app .env
-# ----------------------------
 cat >"$APP_DIR/.env" <<EOF
 TIMEZONE=${TIMEZONE}
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
@@ -656,48 +585,26 @@ PASARGUARD_ENV=${PASARGUARD_ENV}
 EOF
 chmod 600 "$APP_DIR/.env"
 
-# ----------------------------
-# Validate Telegram token (no secret echo)
-# ----------------------------
 echo "ℹ️  Validating Telegram bot token (getMe)..."
-if ! curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" >/dev/null; then
+# ✅ FIX: no stdin consumption
+if ! curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" </dev/null >/dev/null; then
   echo "❌ Telegram token invalid (getMe failed)."
   exit 1
 fi
-echo "✅ Telegram token OK. Token=${BOT_TOKEN:+$(mask "$BOT_TOKEN")}"
+echo "✅ Telegram token OK."
 
-# ----------------------------
-# Create venv + deps
-# ----------------------------
 echo "ℹ️  Creating Python venv..."
 python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install -U pip >/dev/null
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" >/dev/null
 echo "✅ Python deps installed."
 
-# ----------------------------
-# Apply triggers
-# ----------------------------
 echo "ℹ️  Applying triggers inside MySQL container..."
-TRIG_OUT="$(
-  set +e
-  docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
-    mysql -uroot "$DB_NAME" < "$APP_DIR/triggers.sql" 2>&1
-  echo "RC=$?"
-)"
-RC="$(echo "$TRIG_OUT" | tail -n1 | sed -E 's/^RC=//')"
-if [[ "${RC:-1}" != "0" ]]; then
-  echo "❌ Failed to apply triggers. Output:"
-  echo "--------------------------------------"
-  echo "$TRIG_OUT" | sed '$d'
-  echo "--------------------------------------"
-  exit 1
-fi
+# This one MUST use -i because we feed triggers.sql via redirection (safe)
+docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
+  mysql -uroot "$DB_NAME" < "$APP_DIR/triggers.sql"
 echo "✅ Triggers applied."
 
-# ----------------------------
-# Install cron
-# ----------------------------
 echo "ℹ️  Installing cron (daily 00:00 ${TIMEZONE})..."
 touch "$LOG_FILE"
 chmod 644 "$LOG_FILE"
@@ -722,11 +629,8 @@ systemctl enable cron >/dev/null 2>&1 || true
 systemctl restart cron >/dev/null 2>&1 || true
 echo "✅ Cron installed."
 
-# ----------------------------
-# Send install message
-# ----------------------------
 echo "ℹ️  Sending test message..."
-curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" </dev/null \
   -d "chat_id=${CHAT_ID}" \
   -d "text=pasarguard-admin-report نصب شد ✅" >/dev/null || true
 
