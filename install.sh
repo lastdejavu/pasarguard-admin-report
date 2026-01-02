@@ -153,7 +153,8 @@ else
   echo
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "Telegram setup"
-  echo "If it looks 'stuck', it's waiting for you to paste token/chat_id."
+  echo "Bot Token هنگام paste نمایش داده نمی‌شود (برای امنیت). فقط Paste کن و Enter بزن."
+  echo "Chat ID نمایش داده می‌شود."
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
   if [[ -z "$BOT_TOKEN" ]]; then
@@ -513,8 +514,6 @@ ORDER BY e.admin_id ASC, e.id ASC;
                 if oldv is None or newv is None:
                     if newv is None:
                         st["unlimited"] = True
-                        if oldv is not None:
-                            st["was_limit_bytes"] = int(oldv)
                     continue
                 diff = int(newv) - int(oldv)
                 if diff > 0:
@@ -540,16 +539,13 @@ ORDER BY e.admin_id ASC, e.id ASC;
 
         for u in sorted(user_state.keys()):
             st = user_state[u]
-
             if st["unlimited"]:
                 lines.append(f"- {u}: unlimited")
                 any_line = True
                 continue
-
             charge = st["charge_bytes"]
             if charge <= 0:
                 continue
-
             g = gb_from_bytes(charge)
             total_gb += g
             lines.append(f"- {u}: +{fmt_gb(g)}")
@@ -586,7 +582,6 @@ EOF
 chmod 600 "$APP_DIR/.env"
 
 echo "ℹ️  Validating Telegram bot token (getMe)..."
-# ✅ FIX: no stdin consumption
 if ! curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/getMe" </dev/null >/dev/null; then
   echo "❌ Telegram token invalid (getMe failed)."
   exit 1
@@ -600,9 +595,9 @@ python3 -m venv "$APP_DIR/.venv"
 echo "✅ Python deps installed."
 
 echo "ℹ️  Applying triggers inside MySQL container..."
-# This one MUST use -i because we feed triggers.sql via redirection (safe)
+# ✅ Improvement: silence triggers.sql output (removes the stray "1" lines)
 docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
-  mysql -uroot "$DB_NAME" < "$APP_DIR/triggers.sql"
+  mysql -uroot "$DB_NAME" < "$APP_DIR/triggers.sql" >/dev/null
 echo "✅ Triggers applied."
 
 echo "ℹ️  Installing cron (daily 00:00 ${TIMEZONE})..."
